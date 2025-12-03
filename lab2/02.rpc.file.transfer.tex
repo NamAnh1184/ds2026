@@ -1,0 +1,328 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{listings}
+
+\title{Practical Work 2 -- RPC File Transfer}
+\author{Your Group Name \\ Distributed Systems -- USTH}
+\date{\today}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  language=C
+}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+According to the assignment ``Practical work 2: RPC File transfer'',
+we extend our previous TCP file transfer system to a simple
+\textbf{Remote Procedure Call (RPC)} service.
+The goal is to make the file transfer look like a normal procedure call
+from the client's point of view, while the actual work is executed on
+the server side over the network.
+
+\section{RPC Service Design}
+
+\subsection{Remote Interface}
+
+We define a very small RPC interface with a single remote procedure:
+
+\begin{itemize}
+  \item \texttt{int SendFile(string filename, uint64 size, opaque data[size]);}
+\end{itemize}
+
+The semantics of \texttt{SendFile} are:
+
+\begin{itemize}
+  \item The client calls \texttt{SendFile} with the path to a local file.
+  \item The stub extracts the bare file name, obtains the file size and
+        streams the file content as the \texttt{data} parameter.
+  \item The server stub receives the request, writes the file to disk and
+        returns an integer status code (0 = success, non-zero = error).
+\end{itemize}
+
+Instead of using a heavy external framework, we implement a lightweight
+binary RPC protocol on top of TCP. Each request starts with a procedure
+identifier, followed by the marshalled arguments.
+
+\subsection{Message Format}
+
+For the procedure \texttt{SendFile}, the request message has the following
+structure:
+
+\begin{enumerate}
+  \item \textbf{Procedure ID}: 32-bit unsigned integer in network byte order.
+        We use ID~1 for \texttt{SendFile}.
+  \item \textbf{File name length}: 32-bit unsigned integer (network order)
+        giving the length $N$ of the file name.
+  \item \textbf{File name}: $N$ bytes containing the file name, without
+        any terminating \verb|\0|.
+  \item \textbf{File size}: 64-bit unsigned integer (network order)
+        representing the file size in bytes.
+  \item \textbf{File data}: exactly \emph{size} bytes of raw file content.
+\end{enumerate}
+
+The response message consists of a single 32-bit integer status code in
+network byte order. Figure~\ref{fig:rpc-protocol} summarises the layout.
+
+\begin{figure}[h]
+  \centering
+  \fbox{\parbox{0.9\linewidth}{
+    \textbf{Client} $\rightarrow$ \textbf{Server} (request):
+    \begin{itemize}
+      \item proc\_id (uint32)
+      \item name\_len (uint32)
+      \item filename (name\_len bytes)
+      \item file\_size (uint64)
+      \item file\_data (file\_size bytes)
+    \end{itemize}
+    \vspace{0.5em}
+    \textbf{Server} $\rightarrow$ \textbf{Client} (response):
+    \begin{itemize}
+      \item status (int32)
+    \end{itemize}
+  }}
+  \caption{Custom RPC message format for \texttt{SendFile}.}
+  \label{fig:rpc-protocol}
+\end{figure}
+
+\section{System Organisation}
+
+We keep the same client--server structure as in Practical Work~1, but we
+separate the application logic into local procedures and RPC stubs.
+
+\begin{itemize}
+  \item \textbf{RPC server}:
+    \begin{itemize}
+      \item Listens on a TCP port for incoming RPC connections.
+      \item For each connection, reads the procedure ID and dispatches the
+            call to the corresponding server stub.
+      \item The \texttt{SendFile} server stub receives the file and stores
+            it on disk.
+    \end{itemize}
+  \item \textbf{RPC client}:
+    \begin{itemize}
+      \item Connects to the RPC server using TCP.
+      \item Exposes a local function \texttt{rpc\_send\_file()} that looks
+            like a normal function call.
+      \item The client stub marshals the arguments into the message format
+            and waits for the status code.
+    \end{itemize}
+\end{itemize}
+
+\section{Implementation Overview}
+
+\subsection{Server Skeleton}
+
+The core of the server-side request handler is shown in
+Listing~\ref{lst:rpc-server}. It performs the following steps:
+
+\begin{enumerate}
+  \item Read the procedure ID.
+  \item If the ID is \texttt{PROC\_SEND\_FILE}, receive the arguments
+        (file name and size) and stream the file content to disk.
+  \item Return a status code to the client.
+\end{enumerate}
+
+\begin{lstlisting}[caption={Server-side RPC handler for \texttt{SendFile}},
+                 label={lst:rpc-server}]
+#define PROC_SEND_FILE 1
+
+static void handle_rpc_request(int connfd) {
+    uint32_t proc_id_n;
+    if (readn(connfd, &proc_id_n, sizeof(proc_id_n))
+        != sizeof(proc_id_n)) {
+        fprintf(stderr, "Failed to read procedure id\n");
+        return;
+    }
+    uint32_t proc_id = ntohl(proc_id_n);
+
+    if (proc_id != PROC_SEND_FILE) {
+        fprintf(stderr, "Unknown procedure id: %u\n", proc_id);
+        return;
+    }
+
+    uint32_t name_len_n;
+    if (readn(connfd, &name_len_n, sizeof(name_len_n))
+        != sizeof(name_len_n)) {
+        fprintf(stderr, "Failed to read name length\n");
+        return;
+    }
+    uint32_t name_len = ntohl(name_len_n);
+
+    char *filename = malloc(name_len + 1);
+    if (!filename) return;
+    if (readn(connfd, filename, name_len) != (ssize_t)name_len) {
+        fprintf(stderr, "Failed to read file name\n");
+        free(filename);
+        return;
+    }
+    filename[name_len] = '\0';
+
+    uint64_t size_n;
+    if (readn(connfd, &size_n, sizeof(size_n)) != sizeof(size_n)) {
+        fprintf(stderr, "Failed to read file size\n");
+        free(filename);
+        return;
+    }
+    uint64_t file_size = ntohll(size_n);
+
+    FILE *out = fopen(filename, "wb");
+    if (!out) {
+        perror("fopen");
+        free(filename);
+        return;
+    }
+
+    char buffer[4096];
+    uint64_t remaining = file_size;
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(buffer)
+                     ? remaining : sizeof(buffer);
+        ssize_t n = read(connfd, buffer, chunk);
+        if (n <= 0) break;
+        fwrite(buffer, 1, n, out);
+        remaining -= (uint64_t)n;
+    }
+
+    fclose(out);
+    free(filename);
+
+    int32_t status = (remaining == 0) ? 0 : -1;
+    int32_t status_n = htonl(status);
+    writen(connfd, &status_n, sizeof(status_n));
+}
+\end{lstlisting}
+
+\subsection{Client Stub}
+
+On the client side, the application simply calls
+\verb|rpc_send_file(sockfd, path)|. The stub opens the file, collects
+its metadata and sends the RPC request, as shown in
+Listing~\ref{lst:rpc-client}.
+
+\begin{lstlisting}[caption={Client-side RPC stub for \texttt{SendFile}},
+                 label={lst:rpc-client}]
+#define PROC_SEND_FILE 1
+
+int rpc_send_file(int sockfd, const char *path) {
+    const char *name = strrchr(path, '/');
+    name = (name == NULL) ? path : name + 1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return -1;
+    }
+    uint64_t size = (uint64_t)st.st_size;
+
+    uint32_t proc_id_n = htonl(PROC_SEND_FILE);
+    if (writen(sockfd, &proc_id_n, sizeof(proc_id_n))
+        != sizeof(proc_id_n)) {
+        fprintf(stderr, "Failed to send proc id\n");
+        close(fd);
+        return -1;
+    }
+
+    uint32_t len = (uint32_t)strlen(name);
+    uint32_t len_n = htonl(len);
+    if (writen(sockfd, &len_n, sizeof(len_n)) != sizeof(len_n)) {
+        fprintf(stderr, "Failed to send name length\n");
+        close(fd);
+        return -1;
+    }
+
+    if (writen(sockfd, name, len) != (ssize_t)len) {
+        fprintf(stderr, "Failed to send file name\n");
+        close(fd);
+        return -1;
+    }
+
+    uint64_t size_n = htonll(size);
+    if (writen(sockfd, &size_n, sizeof(size_n)) != sizeof(size_n)) {
+        fprintf(stderr, "Failed to send file size\n");
+        close(fd);
+        return -1;
+    }
+
+    char buffer[4096];
+    ssize_t n;
+    while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+        if (writen(sockfd, buffer, n) != n) {
+            fprintf(stderr, "Failed to send file data\n");
+            close(fd);
+            return -1;
+        }
+    }
+    close(fd);
+
+    int32_t status_n;
+    if (readn(sockfd, &status_n, sizeof(status_n))
+        != sizeof(status_n)) {
+        fprintf(stderr, "Failed to receive status\n");
+        return -1;
+    }
+    int32_t status = ntohl(status_n);
+    return status;
+}
+\end{lstlisting}
+
+\section{Testing}
+
+We tested the RPC file transfer system on two Linux machines connected
+over a local network:
+
+\begin{itemize}
+  \item Small text files to check that file names and contents are
+        preserved.
+  \item Larger files to observe throughput and stability.
+  \item Error cases such as non-existing input files and network
+        interruptions.
+\end{itemize}
+
+For each successful transfer we compared the original and received files
+using \verb|md5sum| to verify that the checksums match.
+
+\section{Work Distribution}
+
+The work was divided among group members as follows:
+
+\begin{itemize}
+  \item \textbf{Member 1}: design of the RPC interface and client stub.
+  \item \textbf{Member 2}: implementation of the server skeleton and
+        dispatch logic.
+  \item \textbf{Member 3}: testing, documentation and preparation of this
+        \LaTeX{} report.
+\end{itemize}
+
+All members participated in debugging and code review.
+
+\section{Conclusion}
+
+In this practical work we turned our basic TCP file transfer program into
+a small RPC service. By moving file transfer into a remote procedure
+\texttt{SendFile}, the application code now interacts with the system
+through normal-looking function calls, while the RPC layer takes care of
+message formatting and network communication.
+
+Future improvements could include adding more RPC procedures (for example
+\texttt{ListFiles} or \texttt{DeleteFile}), integrating a naming service,
+or migrating to a full-featured RPC framework such as gRPC or JSON-RPC.
+
+\end{document}
